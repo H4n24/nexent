@@ -24,7 +24,7 @@ from fastapi import HTTPException, Query, Body, Path, Depends
 from fastapi.responses import StreamingResponse
 from consts.const import ES_API_KEY, ES_HOST
 from consts.model import SearchRequest, HybridSearchRequest
-from utils.config_utils import config_manager
+from utils.config_utils import config_manager, tenant_config_manager, get_model_name_from_config
 from utils.file_management_utils import get_all_files_status, get_file_size
 from database.knowledge_db import create_knowledge_record, get_knowledge_record, update_knowledge_record, delete_knowledge_record
 
@@ -32,13 +32,14 @@ from database.knowledge_db import create_knowledge_record, get_knowledge_record,
 logger = logging.getLogger("elasticsearch_service")
 
 
-def generate_knowledge_summary_stream(keywords: str, language: str) -> Generator:
+def generate_knowledge_summary_stream(keywords: str, language: str, tenant_id: str) -> Generator:
     """
     Generate a knowledge base summary based on keywords
 
     Args:
         keywords: Keywords that frequently appear in the knowledge base content
         language: Language of the knowledge base content
+        tenant_id: The tenant ID for configuration
 
     Returns:
         str:  Generate a knowledge base summary
@@ -55,14 +56,17 @@ def generate_knowledge_summary_stream(keywords: str, language: str) -> Generator
     messages = [{"role": "system", "content": prompts['system_prompt']},
         {"role": "user", "content": prompts['user_prompt'].format(content=keywords)}]
 
+    # Get model configuration from tenant config manager
+    model_config = tenant_config_manager.get_model_config(key="LLM_SECONDARY_ID", tenant_id=tenant_id)
+    
     # initialize OpenAI client
-    client = OpenAI(api_key=os.getenv('LLM_SECONDARY_API_KEY'),
-                    base_url=os.getenv('LLM_SECONDARY_MODEL_URL'))
+    client = OpenAI(api_key=model_config.get('api_key', ""),
+                    base_url=model_config.get('base_url', ""))
 
     try:
         # Create stream chat completion request
         stream = client.chat.completions.create(
-            model=os.getenv('LLM_SECONDARY_MODEL_NAME'),  # can change model as needed
+            model=get_model_name_from_config(model_config) if model_config.get("model_name") else "",  # use model name from config
             messages=messages,
             stream=True  # enable stream output
         )
@@ -102,6 +106,7 @@ class ElasticSearchService:
             embedding_dim: Optional[int] = Query(None, description="Dimension of the embedding vectors"),
             es_core: ElasticSearchCore = Depends(get_es_core),
             user_id: Optional[str] = Body(None, description="ID of the user creating the knowledge base"),
+            tenant_id: Optional[str] = Body(None, description="ID of the tenant creating the knowledge base"),
     ):
         try:
             if es_core.client.indices.exists(index=index_name):
@@ -109,7 +114,7 @@ class ElasticSearchService:
             success = es_core.create_vector_index(index_name, embedding_dim=embedding_dim or es_core.embedding_dim)
             if not success:
                 raise HTTPException(status_code=500, detail=f"Failed to create index {index_name}")
-            knowledge_data = {'index_name': index_name, 'created_by': user_id}
+            knowledge_data = {'index_name': index_name, 'created_by': user_id, "tenant_id": tenant_id}
             create_knowledge_record(knowledge_data)
             return {"status": "success", "message": f"Index {index_name} created successfully"}
         except Exception as e:
@@ -143,34 +148,61 @@ class ElasticSearchService:
     def list_indices(
             pattern: str = Query("*", description="Pattern to match index names"),
             include_stats: bool = Query(False, description="Whether to include index stats"),
+            user_id: Optional[str] = Body(None, description="ID of the user listing the knowledge base"),
+            tenant_id: Optional[str] = Body(None, description="ID of the tenant listing the knowledge base"),
             es_core: ElasticSearchCore = Depends(get_es_core)
     ):
-        """List all user indices with optional stats"""
-        indices = es_core.get_user_indices(pattern)
+        """
+        List all indices that the current user has permissions to access.
+
+        Args:
+            pattern: Pattern to match index names
+            include_stats: Whether to include index stats
+            user_id: ID of the user listing the knowledge base
+            tenant_id: ID of the tenant listing the knowledge base
+            es_core: ElasticSearchCore instance
+
+        Returns:
+            Dict[str, Any]: A dictionary containing the list of indices and the count.
+        """
+        all_indices_list = es_core.get_user_indices(pattern)
+        print(f"all_indices_list: {all_indices_list}")
+
+        filtered_indices_list = []
+        if tenant_id:
+            for index_name in all_indices_list:
+                # Search in the Postgres database to get the tenant_id
+                knowledge_record = get_knowledge_record(query={"index_name": index_name})
+                if knowledge_record and knowledge_record.get("tenant_id") == tenant_id:
+                    filtered_indices_list.append(index_name)
+        else:
+            filtered_indices_list = all_indices_list
+
+        indices = [info.get("index") if isinstance(info, dict) else info for info in filtered_indices_list]
+        print(f"indices: {indices}")
+
+        response = {
+            "indices": indices,
+            "count": len(indices)
+        }
 
         if include_stats:
-            # 获取所有索引的统计信息
-            all_stats = es_core.get_all_indices_stats(pattern)
-
-            # 构建包含统计信息的索引信息列表
-            indices_info = []
-            for index_name in indices:
-                index_info = {
-                    "name": index_name,
-                    "stats": all_stats.get(index_name, {})
-                }
-                indices_info.append(index_info)
-
-            return {
-                "indices": indices,
-                "count": len(indices),
-                "indices_info": indices_info
-            }
-        else:
-            return {"indices": indices, "count": len(indices)}
+            stats_info = []
+            if filtered_indices_list:
+                indice_stats = es_core.get_index_stats(filtered_indices_list)
+                print(f"indice_stats: {indice_stats}")
+                for index_name in filtered_indices_list:
+                    index_stats = indice_stats.get(index_name, {})
+                    stats_info.append({
+                        "name": index_name,
+                        "stats": index_stats
+                    })
+            response["indices_info"] = stats_info
+        
+        return response
 
     @staticmethod
-    def get_index_info(
+    def get_index_name(
             index_name: str = Path(..., description="Name of the index"),
             es_core: ElasticSearchCore = Depends(get_es_core)
     ):
@@ -648,6 +680,7 @@ class ElasticSearchService:
             batch_size: int = Query(1000, description="Number of documents to retrieve per batch"),
             es_core: ElasticSearchCore = Depends(get_es_core),
             user_id: Optional[str] = Body(None, description="ID of the user delete the knowledge base"),
+            tenant_id: Optional[str] = Body(None, description="ID of the tenant"),
             language: str = 'zh'
     ):
         try:
@@ -662,7 +695,7 @@ class ElasticSearchService:
             async def generate_summary():
                 token_join = []
                 try:
-                    for new_token in generate_knowledge_summary_stream(keywords_for_summary, language):
+                    for new_token in generate_knowledge_summary_stream(keywords_for_summary, language,tenant_id):
                         if new_token == "END":
                             break
                         else:
